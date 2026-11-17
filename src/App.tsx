@@ -3,6 +3,7 @@ import type { ChangeEvent, PointerEvent as ReactPointerEvent } from 'react'
 import './App.css'
 
 type SourceTab = 'url' | 'file' | 'obs'
+type ProcessingStage = 'idle' | 'validating' | 'downloading' | 'analyzing' | 'choosing' | 'exporting' | 'complete' | 'error'
 
 type Candidate = {
   id: number
@@ -43,6 +44,7 @@ function App() {
   const [trimDuration, setTrimDuration] = useState(30)
   const cropDrag = useRef<{ target: 'game' | 'face'; startX: number; startValue: number } | null>(null)
   const [status, setStatus] = useState('Ready for a video')
+  const [processingStage, setProcessingStage] = useState<ProcessingStage>('idle')
   const [isExporting, setIsExporting] = useState(false)
   const [direction, setDirection] = useState('')
   const [candidates, setCandidates] = useState(initialCandidates)
@@ -90,10 +92,18 @@ function App() {
   }
 
   const analyze = async () => {
+    if (sourceTab === 'url' && !url.trim()) {
+      setProcessingStage('error')
+      setStatus('Paste a YouTube URL first')
+      return
+    }
     setIsAnalyzing(true)
-    setStatus(direction ? `Looking for: ${direction}` : 'Analyzing transcript, audio, and chat signals...')
+    setProcessingStage('validating')
+    setStatus('Validating your video source...')
     if (sourceTab === 'url' && url) {
       try {
+        setProcessingStage('downloading')
+        setStatus('Downloading the video locally...')
         const response = await fetch(apiUrl('/api/download'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -101,6 +111,8 @@ function App() {
         })
         const result = await response.json() as { error?: string }
         if (!response.ok) throw new Error(result.error ?? 'Download failed')
+        setProcessingStage('analyzing')
+        setStatus(direction ? `Analyzing for: ${direction}` : 'Analyzing transcript and audio signals...')
         const analysisResponse = await fetch(apiUrl('/api/analyze'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -110,8 +122,10 @@ function App() {
         if (!analysisResponse.ok || !analysis.candidates) throw new Error(analysis.error ?? 'Highlight analysis failed')
         setCandidates(analysis.candidates.map((candidate, index) => ({ ...candidate, color: ['#ff805d', '#7c83fd', '#4ecdc4'][index] ?? '#ff805d' })))
         setSelectedId(analysis.candidates[0]?.id ?? 1)
+        setProcessingStage('choosing')
         setStatus(`${analysis.candidates.length} real highlights found`)
       } catch (error) {
+        setProcessingStage('error')
         setStatus(error instanceof Error ? error.message : 'Could not download this video')
       } finally {
         setIsAnalyzing(false)
@@ -121,6 +135,7 @@ function App() {
     }
     if (sourceTab === 'file' && selectedFile) {
       try {
+        setProcessingStage('downloading')
         setStatus('Uploading your video locally...')
         const uploadResponse = await fetch(apiUrl('/api/upload'), {
           method: 'POST',
@@ -129,6 +144,8 @@ function App() {
         })
         const upload = await uploadResponse.json() as { error?: string }
         if (!uploadResponse.ok) throw new Error(upload.error ?? 'Upload failed')
+        setProcessingStage('analyzing')
+        setStatus(direction ? `Analyzing for: ${direction}` : 'Analyzing transcript and audio signals...')
         const analysisResponse = await fetch(apiUrl('/api/analyze'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -138,8 +155,10 @@ function App() {
         if (!analysisResponse.ok || !analysis.candidates) throw new Error(analysis.error ?? 'Highlight analysis failed')
         setCandidates(analysis.candidates.map((candidate, index) => ({ ...candidate, color: ['#ff805d', '#7c83fd', '#4ecdc4'][index] ?? '#ff805d' })))
         setSelectedId(analysis.candidates[0]?.id ?? 1)
+        setProcessingStage('choosing')
         setStatus(`${analysis.candidates.length} real highlights found`)
       } catch (error) {
+        setProcessingStage('error')
         setStatus(error instanceof Error ? error.message : 'Could not process this file')
       } finally {
         setIsAnalyzing(false)
@@ -148,12 +167,14 @@ function App() {
     }
     window.setTimeout(() => {
       setIsAnalyzing(false)
+      setProcessingStage('choosing')
       setStatus('3 highlight candidates found')
     }, 1200)
   }
 
   const exportClip = async () => {
     setIsExporting(true)
+    setProcessingStage('exporting')
     setStatus('Rendering a 9:16 MP4 with FFmpeg...')
     try {
       const response = await fetch(apiUrl('/api/export'), {
@@ -163,8 +184,10 @@ function App() {
       })
       const result = await response.json() as { error?: string; path?: string }
       if (!response.ok) throw new Error(result.error ?? 'Export failed')
+      setProcessingStage('complete')
       setStatus(`${captionsEnabled ? 'Captioned' : 'Clean'} export complete: ${result.path?.split(/[\\/]/).pop() ?? 'MP4 ready'}`)
     } catch (error) {
+      setProcessingStage('error')
       setStatus(error instanceof Error ? error.message : 'Could not export this clip')
     } finally {
       setIsExporting(false)
@@ -184,7 +207,11 @@ function App() {
       </header>
 
       <main>
-        <div className="workflow-bar" aria-label="Workflow progress"><span className="workflow-step active"><b>1</b> Add video</span><i /> <span className="workflow-step"><b>2</b> Choose moments</span><i /> <span className="workflow-step"><b>3</b> Style &amp; export</span></div>
+        <div className="workflow-bar" aria-label="Workflow progress">
+          <span className={`workflow-step ${processingStage !== 'idle' ? 'complete' : 'active'}`}><b>{processingStage !== 'idle' ? '✓' : '1'}</b> Add video</span><i />
+          <span className={`workflow-step ${['analyzing', 'choosing', 'exporting', 'complete'].includes(processingStage) ? 'active' : ''}`}><b>2</b> Choose moments</span><i />
+          <span className={`workflow-step ${['exporting', 'complete'].includes(processingStage) ? 'active' : ''}`}><b>3</b> Style &amp; export</span>
+        </div>
         <section className="hero-section">
           <div>
             <p className="eyebrow">AI CLIP STUDIO <span>·</span> FREE &amp; LOCAL</p>
@@ -221,6 +248,23 @@ function App() {
             <div className="signal-list">
               <span className="signal-label">LOOK FOR</span>
               <span className="signal active">✦ Interesting speech</span><span className="signal active">◒ Audio peaks</span><span className="signal active">▣ Chat spikes</span>
+            </div>
+            <div className="processing-steps" aria-live="polite">
+              <div className="processing-heading"><span>LIVE PROGRESS</span><small>{processingStage === 'error' ? 'Needs attention' : processingStage === 'complete' ? 'Finished' : 'Local processing'}</small></div>
+              {([
+                ['validating', '1', 'Validate source'],
+                ['downloading', '2', 'Download video'],
+                ['analyzing', '3', 'Analyze moments'],
+                ['choosing', '4', 'Review highlights'],
+                ['exporting', '5', 'Render final clip'],
+              ] as const).map(([step, number, label]) => {
+                const stageOrder = ['idle', 'validating', 'downloading', 'analyzing', 'choosing', 'exporting', 'complete']
+                const currentOrder = stageOrder.indexOf(processingStage === 'error' ? 'idle' : processingStage)
+                const stepOrder = stageOrder.indexOf(step)
+                const isDone = processingStage === 'complete' || currentOrder > stepOrder
+                const isCurrent = processingStage === step
+                return <div className={`processing-step ${isDone ? 'done' : ''} ${isCurrent ? 'current' : ''}`} key={step}><b>{isDone ? '✓' : number}</b><span>{label}</span>{isCurrent && <i>working</i>}</div>
+              })}
             </div>
             <div className="panel-footer"><span className="status-text"><span className="tiny-dot" /> {status}</span><button className="primary-button" onClick={analyze} disabled={isAnalyzing}>{isAnalyzing ? 'Analyzing...' : 'Find highlights'} <span>→</span></button></div>
           </div>

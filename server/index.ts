@@ -232,19 +232,25 @@ createServer(async (request, response) => {
       const downloader = spawn(ytDlpCommand, ['--no-playlist', '--merge-output-format', 'mp4', '--print', 'after_move:filepath', '-o', outputPath, url], { windowsHide: true })
       let output = ''
       let errorOutput = ''
+      let responseSent = false
+      const finishDownload = (status: number, body: object) => {
+        if (responseSent || response.headersSent) return
+        responseSent = true
+        sendJson(response, status, body)
+      }
       downloader.stdout.on('data', (chunk: Buffer) => { output += chunk.toString() })
       downloader.stderr.on('data', (chunk: Buffer) => { errorOutput += chunk.toString() })
 
       downloader.on('close', (code) => {
         if (code !== 0) {
           const message = errorOutput.includes('not recognized') ? 'yt-dlp is not available in this terminal. Restart VS Code after installing it.' : 'The video could not be downloaded. Check the URL and your permissions.'
-          sendJson(response, 422, { error: message })
+          finishDownload(422, { error: message })
           return
         }
         currentVideoPath = output.trim().split(/\r?\n/).pop() ?? null
-        sendJson(response, 200, { ok: true, path: currentVideoPath })
+        finishDownload(200, { ok: true, path: currentVideoPath })
       })
-      downloader.on('error', () => sendJson(response, 500, { error: 'Could not start yt-dlp. Restart VS Code and try again.' }))
+      downloader.on('error', () => finishDownload(500, { error: 'Could not start yt-dlp. Restart VS Code and try again.' }))
     } catch {
       sendJson(response, 400, { error: 'Invalid request body.' })
     }
