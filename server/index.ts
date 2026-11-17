@@ -29,7 +29,12 @@ function isYouTubeUrl(value: string) {
 }
 
 function sendJson(response: import('node:http').ServerResponse, status: number, body: object) {
-  response.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': 'http://localhost:5173' })
+  response.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, X-File-Name',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  })
   response.end(JSON.stringify(body))
 }
 
@@ -85,7 +90,11 @@ await mkdir(downloadsDirectory, { recursive: true })
 
 createServer(async (request, response) => {
   if (request.method === 'OPTIONS') {
-    response.writeHead(204, { 'Access-Control-Allow-Origin': 'http://localhost:5173', 'Access-Control-Allow-Headers': 'Content-Type' })
+    response.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type, X-File-Name',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    })
     response.end()
     return
   }
