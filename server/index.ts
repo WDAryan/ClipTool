@@ -1,7 +1,7 @@
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { access, mkdir, unlink } from 'node:fs/promises'
-import { createWriteStream } from 'node:fs'
+import { access, mkdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { createReadStream, createWriteStream } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -13,6 +13,8 @@ const ffmpegCommand = process.env.CLIPFORGE_FFMPEG ?? 'ffmpeg'
 const pythonCommand = process.env.CLIPFORGE_PYTHON ?? 'python'
 const ytDlpCommand = process.env.CLIPFORGE_YTDLP ?? 'yt-dlp'
 let currentVideoPath: string | null = null
+const previewPaths = new Map<number, string>()
+const montageRanges = new Map<number, Array<{ start: number; duration: number }>>()
 const clipRanges = new Map([
   [1, { start: 134, duration: 34 }],
   [2, { start: 246, duration: 26 }],
@@ -36,6 +38,15 @@ function sendJson(response: import('node:http').ServerResponse, status: number, 
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   })
   response.end(JSON.stringify(body))
+}
+
+function trendingFrameFilter(frame: string) {
+  if (frame === 'Clean white') return ',drawbox=x=24:y=24:w=iw-48:h=ih-48:c=white@0.95:t=18'
+  if (frame === 'Neon pink') return ',drawbox=x=18:y=18:w=iw-36:h=ih-36:c=0xFF3B9D@1:t=16,drawbox=x=34:y=34:w=iw-68:h=ih-68:c=0xFFB5D9@0.9:t=4'
+  if (frame === 'Neon cyan') return ',drawbox=x=18:y=18:w=iw-36:h=ih-36:c=0x00E7FF@1:t=16,drawbox=x=34:y=34:w=iw-68:h=ih-68:c=0x62F6FF@0.9:t=4'
+  if (frame === 'Gold glow') return ',drawbox=x=22:y=22:w=iw-44:h=ih-44:c=0xFFD166@1:t=16,drawbox=x=38:y=38:w=iw-76:h=ih-76:c=0xFFF1A8@0.85:t=4'
+  if (frame === 'Dark edge') return ',drawbox=x=0:y=0:w=iw:h=86:c=black@0.72:t=fill,drawbox=x=0:y=ih-86:w=iw:h=86:c=black@0.72:t=fill'
+  return ''
 }
 
 function runCommand(command: string, args: string[]) {
@@ -83,6 +94,12 @@ async function readBody(request: import('node:http').IncomingMessage) {
     captionStyle?: 'Karaoke' | 'Clean' | 'Bold'
     trimOffset?: number
     trimDuration?: number
+    stackTop?: 'game' | 'face'
+    mode?: 'highlights' | 'montage'
+    montageParts?: Array<{ start: number; duration: number }> | null
+    frame?: string
+    captionFontSize?: 'Small' | 'Medium' | 'Large' | 'Extra Large' | 'Custom'
+    customCaptionFontSize?: number
   }
 }
 
@@ -104,6 +121,125 @@ createServer(async (request, response) => {
     return
   }
 
+  const previewClipMatch = /^\/api\/preview-clip\/(\d+)\.mp4/.exec(request.url ?? '')
+  if (request.method === 'GET' && previewClipMatch) {
+    try {
+      const clipId = Number(previewClipMatch[1])
+      const previewPath = previewPaths.get(clipId)
+      if (!previewPath) {
+        sendJson(response, 404, { error: 'Prepare a highlight preview first.' })
+        return
+      }
+      await access(previewPath)
+      const fileStats = await stat(previewPath)
+      const rangeHeader = request.headers.range
+      response.setHeader('Access-Control-Allow-Origin', '*')
+      response.setHeader('Accept-Ranges', 'bytes')
+      response.setHeader('Content-Type', 'video/mp4')
+      if (rangeHeader) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader)
+        if (match) {
+          const start = match[1] ? Number(match[1]) : 0
+          const end = match[2] ? Number(match[2]) : fileStats.size - 1
+          const safeStart = Math.max(0, Math.min(start, fileStats.size - 1))
+          const safeEnd = Math.max(safeStart, Math.min(end, fileStats.size - 1))
+          response.writeHead(206, {
+            'Content-Range': `bytes ${safeStart}-${safeEnd}/${fileStats.size}`,
+            'Content-Length': safeEnd - safeStart + 1,
+          })
+          createReadStream(previewPath, { start: safeStart, end: safeEnd }).pipe(response)
+          return
+        }
+      }
+      response.writeHead(200, { 'Content-Length': fileStats.size })
+      createReadStream(previewPath).pipe(response)
+    } catch {
+      sendJson(response, 404, { error: 'Clip preview is not available.' })
+    }
+    return
+  }
+
+  if (request.method === 'POST' && request.url === '/api/preview-clip') {
+    try {
+      const { clipId, trimOffset = 0, trimDuration, montageParts = null, frame = 'None' } = await readBody(request)
+      const range = clipRanges.get(Number(clipId))
+      const inputPath = currentVideoPath ?? join(downloadsDirectory, 'raj-shamani.mp4')
+      if (!range) {
+        sendJson(response, 400, { error: 'Choose a valid highlight first.' })
+        return
+      }
+      await access(inputPath)
+      const start = range.start + Math.max(0, Math.min(15, trimOffset))
+      const duration = Math.max(5, Math.min(range.duration - Math.max(0, trimOffset), trimDuration ?? range.duration))
+      const previewPath = join(downloadsDirectory, `clipforge-preview-${clipId}.mp4`)
+      const previewVideoFilter = `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920${trendingFrameFilter(frame)}`
+      const parts = montageParts?.length ? montageParts : montageRanges.get(Number(clipId))
+      if (parts?.length) {
+        const stamp = Date.now()
+        const segmentPaths: string[] = []
+        const concatPath = join(downloadsDirectory, `clipforge-preview-list-${clipId}-${stamp}.txt`)
+        for (let index = 0; index < parts.length; index += 1) {
+          const segmentPath = join(downloadsDirectory, `clipforge-preview-part-${clipId}-${stamp}-${index}.mp4`)
+          segmentPaths.push(segmentPath)
+          await runCommand(ffmpegCommand, [
+            '-y', '-ss', String(parts[index].start), '-i', inputPath, '-t', String(parts[index].duration),
+            '-vf', previewVideoFilter,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+            '-c:a', 'aac', '-b:a', '192k', segmentPath,
+          ])
+        }
+        await writeFile(concatPath, segmentPaths.map((path) => `file '${path.replaceAll('\\', '/').replaceAll("'", "''")}'`).join('\n'), 'utf8')
+        await runCommand(ffmpegCommand, ['-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', '-movflags', '+faststart', previewPath])
+        await Promise.all(segmentPaths.map((path) => unlink(path).catch(() => undefined)))
+        await unlink(concatPath).catch(() => undefined)
+      } else {
+        await runCommand(ffmpegCommand, [
+          '-y', '-ss', String(start), '-i', inputPath, '-t', String(duration),
+          '-vf', previewVideoFilter,
+          '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+          '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', previewPath,
+        ])
+      }
+      previewPaths.set(Number(clipId), previewPath)
+      sendJson(response, 200, { ok: true, clipId: Number(clipId), path: previewPath })
+    } catch {
+      sendJson(response, 500, { error: 'Could not prepare the selected clip preview.' })
+    }
+    return
+  }
+
+  if (request.method === 'GET' && request.url?.startsWith('/api/preview')) {
+    try {
+      const inputPath = currentVideoPath ?? join(downloadsDirectory, 'raj-shamani.mp4')
+      await access(inputPath)
+      const fileStats = await stat(inputPath)
+      const rangeHeader = request.headers.range
+      response.setHeader('Access-Control-Allow-Origin', '*')
+      response.setHeader('Accept-Ranges', 'bytes')
+      response.setHeader('Content-Type', 'video/mp4')
+      if (rangeHeader) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader)
+        if (match) {
+          const start = match[1] ? Number(match[1]) : 0
+          const end = match[2] ? Number(match[2]) : fileStats.size - 1
+          const safeStart = Math.max(0, Math.min(start, fileStats.size - 1))
+          const safeEnd = Math.max(safeStart, Math.min(end, fileStats.size - 1))
+          response.writeHead(206, {
+            'Content-Range': `bytes ${safeStart}-${safeEnd}/${fileStats.size}`,
+            'Content-Length': safeEnd - safeStart + 1,
+          })
+          createReadStream(inputPath, { start: safeStart, end: safeEnd }).pipe(response)
+          return
+        }
+      }
+      response.writeHead(200, { 'Content-Length': fileStats.size })
+      createReadStream(inputPath).pipe(response)
+    } catch {
+      sendJson(response, 404, { error: 'Preview source is not available.' })
+    }
+    return
+  }
+
   if (request.method === 'POST' && request.url === '/api/export') {
     try {
       const {
@@ -118,6 +254,11 @@ createServer(async (request, response) => {
         captionStyle = 'Karaoke',
         trimOffset = 0,
         trimDuration,
+        stackTop = 'game',
+        montageParts = null,
+        frame = 'None',
+        captionFontSize = 'Large',
+        customCaptionFontSize = 48,
       } = await readBody(request)
       const range = clipRanges.get(Number(clipId))
       const inputPath = currentVideoPath ?? join(downloadsDirectory, 'raj-shamani.mp4')
@@ -137,26 +278,62 @@ createServer(async (request, response) => {
       const safeFaceFocus = Math.min(100, Math.max(0, faceFocus)) / 100
       const gameX = (1 - safeSplit) * safeGameFocus
       const faceX = safeSplit * safeFaceFocus
+      const topHeight = Math.round(1920 * safeSplit)
+      const bottomHeight = 1920 - topHeight
       const videoFilter = template === 'Custom split'
         ? `[0:v]split=2[game][face];[game]crop=iw*${safeSplit}:ih:iw*${gameX}:0,scale=540:1920[gameout];[face]crop=iw*${1 - safeSplit}:ih:iw*${faceX}:0,scale=540:1920[faceout];[gameout][faceout]hstack=inputs=2`
-        : 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920'
-      await runCommand(ffmpegCommand, [
-        '-y', '-ss', String(start), '-i', inputPath, '-t', String(duration),
-        '-vf', videoFilter,
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-c:a', 'aac', tempPath,
-      ])
+        : template === 'Top & Bottom split'
+          ? `[0:v]split=2[game][face];[game]scale=1080:${topHeight}:force_original_aspect_ratio=increase,crop=1080:${topHeight}[gameout];[face]scale=1080:${bottomHeight}:force_original_aspect_ratio=increase,crop=1080:${bottomHeight}[faceout];${stackTop === 'game' ? '[gameout][faceout]' : '[faceout][gameout]'}vstack=inputs=2`
+          : 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920'
+      const framedVideoFilter = `${videoFilter}${trendingFrameFilter(frame)}`
+      const parts = montageParts?.length
+        ? montageParts
+        : montageRanges.get(Number(clipId))
+      if (parts?.length) {
+        const segmentPaths: string[] = []
+        const concatPath = join(downloadsDirectory, `clipforge-montage-list-${stamp}.txt`)
+        for (let index = 0; index < parts.length; index += 1) {
+          const segmentPath = join(downloadsDirectory, `clipforge-montage-part-${stamp}-${index}.mp4`)
+          segmentPaths.push(segmentPath)
+          await runCommand(ffmpegCommand, [
+            '-y', '-ss', String(parts[index].start), '-i', inputPath, '-t', String(parts[index].duration),
+            '-vf', framedVideoFilter,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-c:a', 'aac', segmentPath,
+          ])
+        }
+        await writeFile(concatPath, segmentPaths.map((path) => `file '${path.replaceAll('\\', '/').replaceAll("'", "''")}'`).join('\n'), 'utf8')
+        await runCommand(ffmpegCommand, ['-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', '-movflags', '+faststart', tempPath])
+        await Promise.all(segmentPaths.map((path) => unlink(path).catch(() => undefined)))
+        await unlink(concatPath).catch(() => undefined)
+      } else {
+        await runCommand(ffmpegCommand, [
+          '-y', '-ss', String(start), '-i', inputPath, '-t', String(duration),
+          '-vf', framedVideoFilter,
+          '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-c:a', 'aac', tempPath,
+        ])
+      }
       if (captions) {
         await runCommand(pythonCommand, [join(toolsDirectory, 'transcribe.py'), tempPath, subtitlePath, language])
         const subtitleFilterPath = subtitlePath.replaceAll('\\', '/').replace(':', '\\:')
         const alignment = position === 'top' ? 8 : position === 'middle' ? 5 : 2
+        const marginV = position === 'top' ? 260 : position === 'middle' ? 0 : 220
+        const captionFont = captionFontSize === 'Custom'
+          ? Math.min(96, Math.max(20, customCaptionFontSize))
+          : captionFontSize === 'Small'
+          ? 30
+          : captionFontSize === 'Medium'
+            ? 38
+            : captionFontSize === 'Extra Large'
+              ? 58
+              : 48
         const style = captionStyle === 'Bold'
-          ? 'FontName=Arial,FontSize=24,Bold=1,PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=3'
+          ? `FontName=Arial,FontSize=${captionFont},Bold=1,PrimaryColour=&H0000FFFFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=5,Shadow=2`
           : captionStyle === 'Clean'
-            ? 'FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=2'
-            : 'FontName=Arial,FontSize=18,Bold=1,PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=2'
+            ? `FontName=Arial,FontSize=${captionFont - 4},PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=3,Shadow=1`
+            : `FontName=Arial,FontSize=${captionFont - 2},Bold=1,PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=4,Shadow=1`
         await runCommand(ffmpegCommand, [
           '-y', '-i', tempPath,
-          '-vf', `subtitles='${subtitleFilterPath}':force_style='${style},Alignment=${alignment},MarginV=120'`,
+          '-vf', `subtitles='${subtitleFilterPath}':force_style='${style},Alignment=${alignment},MarginV=${marginV},MarginL=100,MarginR=100,WrapStyle=0,PlayResX=1080,PlayResY=1920'`,
           '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-c:a', 'copy', '-movflags', '+faststart', outputPath,
         ])
       } else {
@@ -165,18 +342,20 @@ createServer(async (request, response) => {
       await unlink(tempPath).catch(() => undefined)
       await unlink(subtitlePath).catch(() => undefined)
       sendJson(response, 200, { ok: true, path: outputPath, captions })
-    } catch {
-      sendJson(response, 500, { error: 'Captioned export failed. Check that FFmpeg and the local Whisper setup are available.' })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Captioned export failed.'
+      sendJson(response, 500, { error: `Export failed: ${message.slice(-700)}` })
     }
     return
   }
 
   if (request.method === 'POST' && request.url === '/api/analyze') {
     try {
-      const { direction = '' } = await readBody(request)
+      const { direction = '', mode = 'highlights' } = await readBody(request)
       const inputPath = currentVideoPath ?? join(downloadsDirectory, 'raj-shamani.mp4')
       await access(inputPath)
-      const output = await runJsonCommand(pythonCommand, [join(toolsDirectory, 'analyze_highlights.py'), inputPath])
+      const scriptName = mode === 'montage' ? 'analyze_montage.py' : 'analyze_highlights.py'
+      const output = await runJsonCommand(pythonCommand, [join(toolsDirectory, scriptName), inputPath])
       const results = JSON.parse(output) as Array<{
         id: number
         start: number
@@ -185,13 +364,20 @@ createServer(async (request, response) => {
         time: string
         score: number
         reason: string
+        parts?: Array<{ start: number; duration: number }>
       }>
       const directionText = direction.trim().toLowerCase()
       const filtered = directionText
         ? results.map((item) => ({ ...item, reason: `${item.reason} · Focus: ${direction.trim()}` }))
         : results
       clipRanges.clear()
+      montageRanges.clear()
       for (const item of filtered) clipRanges.set(item.id, { start: item.start, duration: item.duration })
+      if (mode === 'montage') {
+        for (const item of filtered) {
+          if (item.parts?.length) montageRanges.set(item.id, item.parts)
+        }
+      }
       sendJson(response, 200, { ok: true, candidates: filtered })
     } catch {
       sendJson(response, 500, { error: 'Highlight analysis failed. Check that the local video and Whisper setup are available.' })

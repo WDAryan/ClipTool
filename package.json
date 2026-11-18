@@ -8,7 +8,7 @@
     "dev:server": "node server/index.ts",
     "desktop:dev": "tauri dev",
     "desktop:prepare": "node scripts/prepare-runtime.mjs",
-    "desktop:build": "npm run desktop:prepare && tauri build",
+    "desktop:build": "npm run desktop:prepare && tauri build --bundles nsis",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"

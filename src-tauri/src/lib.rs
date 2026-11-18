@@ -3,24 +3,35 @@ use std::fs::OpenOptions;
 use std::process::{Command, Stdio};
 use tauri::Manager;
 
+fn normalize_windows_path(path: std::path::PathBuf) -> std::path::PathBuf {
+  let value = path.to_string_lossy();
+  if let Some(stripped) = value.strip_prefix(r"\\?\") {
+    std::path::PathBuf::from(stripped)
+  } else if let Some(stripped) = value.strip_prefix(r"\??\") {
+    std::path::PathBuf::from(stripped)
+  } else {
+    path
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
     .setup(|app| {
       #[cfg(not(debug_assertions))]
       {
-        let resource_dir = app.path().resource_dir()?;
+        let resource_dir = normalize_windows_path(app.path().resource_dir()?);
         let resource_dir = if resource_dir.join("runtime").exists() {
-          resource_dir
+          normalize_windows_path(resource_dir)
         } else {
-          let nested_resource_dir = resource_dir.join("_up_");
+          let nested_resource_dir = normalize_windows_path(resource_dir.join("_up_"));
           if nested_resource_dir.join("runtime").exists() {
             nested_resource_dir
           } else {
             resource_dir
           }
         };
-        let app_data_dir = app.path().app_data_dir()?;
+        let app_data_dir = normalize_windows_path(app.path().app_data_dir()?);
         fs::create_dir_all(&app_data_dir)?;
         let downloads_dir = app_data_dir.join("downloads");
         fs::create_dir_all(&downloads_dir)?;

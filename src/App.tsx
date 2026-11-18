@@ -14,6 +14,7 @@ type Candidate = {
   color: string
   start?: number
   duration?: number
+  parts?: Array<{ start: number; duration: number }>
 }
 
 const initialCandidates: Candidate[] = [
@@ -33,13 +34,17 @@ function App() {
   const [selectedId, setSelectedId] = useState(1)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [captionStyle, setCaptionStyle] = useState('Karaoke')
+  const [captionFontSize, setCaptionFontSize] = useState<'Small' | 'Medium' | 'Large' | 'Extra Large' | 'Custom'>('Large')
+  const [customCaptionFontSize, setCustomCaptionFontSize] = useState(48)
   const [captionsEnabled, setCaptionsEnabled] = useState(true)
   const [captionLanguage, setCaptionLanguage] = useState<'english' | 'hinglish'>('english')
   const [captionPosition, setCaptionPosition] = useState<'top' | 'middle' | 'bottom'>('bottom')
   const [activeTemplate, setActiveTemplate] = useState('Punchy')
+  const [activeFrame, setActiveFrame] = useState('None')
   const [splitRatio, setSplitRatio] = useState(50)
   const [gameFocus, setGameFocus] = useState(50)
   const [faceFocus, setFaceFocus] = useState(50)
+  const [stackTop, setStackTop] = useState<'game' | 'face'>('game')
   const [trimOffset, setTrimOffset] = useState(0)
   const [trimDuration, setTrimDuration] = useState(30)
   const cropDrag = useRef<{ target: 'game' | 'face'; startX: number; startValue: number } | null>(null)
@@ -47,7 +52,9 @@ function App() {
   const [processingStage, setProcessingStage] = useState<ProcessingStage>('idle')
   const [isExporting, setIsExporting] = useState(false)
   const [direction, setDirection] = useState('')
+  const [analysisMode, setAnalysisMode] = useState<'highlights' | 'montage'>('highlights')
   const [candidates, setCandidates] = useState(initialCandidates)
+  const previewVideoRef = useRef<HTMLVideoElement | null>(null)
 
   const selectedClip = useMemo(
     () => candidates.find((candidate) => candidate.id === selectedId) ?? candidates[0],
@@ -57,17 +64,45 @@ function App() {
   const handleFile = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     if (file) {
-      if (previewUrl) URL.revokeObjectURL(previewUrl)
+      if (previewUrl.startsWith('blob:')) URL.revokeObjectURL(previewUrl)
+      setPreviewUrl('')
       setFileName(file.name)
       setSelectedFile(file)
-      setPreviewUrl(URL.createObjectURL(file))
       setStatus(`${file.name} is ready to analyze`)
     }
   }
 
   useEffect(() => () => {
-    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    if (previewUrl.startsWith('blob:')) URL.revokeObjectURL(previewUrl)
   }, [previewUrl])
+
+  useEffect(() => {
+    if (processingStage !== 'choosing' && processingStage !== 'complete') return
+    const candidate = candidates.find((item) => item.id === selectedId)
+    if (!candidate) return
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await fetch(apiUrl('/api/preview-clip'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            clipId: candidate.id,
+            trimOffset,
+            trimDuration,
+            montageParts: candidate.parts ?? null,
+            frame: activeFrame,
+          }),
+        })
+        const result = await response.json() as { error?: string; clipId?: number }
+        if (!response.ok || !result.clipId) throw new Error(result.error ?? 'Could not prepare clip preview')
+        setPreviewUrl(apiUrl(`/api/preview-clip/${result.clipId}.mp4?v=${Date.now()}`))
+        setStatus(`Preview ready: ${candidate.title}`)
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : 'Could not prepare clip preview')
+      }
+    }, 350)
+    return () => window.clearTimeout(timer)
+  }, [processingStage, selectedId, candidates, trimOffset, trimDuration, activeFrame])
 
   useEffect(() => {
     const moveCrop = (event: PointerEvent) => {
@@ -116,7 +151,7 @@ function App() {
         const analysisResponse = await fetch(apiUrl('/api/analyze'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ direction }),
+          body: JSON.stringify({ direction, mode: analysisMode }),
         })
         const analysis = await analysisResponse.json() as { error?: string; candidates?: Omit<Candidate, 'color'>[] }
         if (!analysisResponse.ok || !analysis.candidates) throw new Error(analysis.error ?? 'Highlight analysis failed')
@@ -149,7 +184,7 @@ function App() {
         const analysisResponse = await fetch(apiUrl('/api/analyze'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ direction }),
+          body: JSON.stringify({ direction, mode: analysisMode }),
         })
         const analysis = await analysisResponse.json() as { error?: string; candidates?: Omit<Candidate, 'color'>[] }
         if (!analysisResponse.ok || !analysis.candidates) throw new Error(analysis.error ?? 'Highlight analysis failed')
@@ -180,7 +215,7 @@ function App() {
       const response = await fetch(apiUrl('/api/export'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clipId: selectedId, captions: captionsEnabled, language: captionLanguage, position: captionPosition, captionStyle, template: activeTemplate, splitRatio, gameFocus, faceFocus, trimOffset, trimDuration }),
+        body: JSON.stringify({ clipId: selectedId, captions: captionsEnabled, language: captionLanguage, position: captionPosition, captionStyle, captionFontSize, customCaptionFontSize, template: activeTemplate, frame: activeFrame, splitRatio, gameFocus, faceFocus, stackTop, trimOffset, trimDuration, montageParts: selectedClip.parts ?? null }),
       })
       const result = await response.json() as { error?: string; path?: string }
       if (!response.ok) throw new Error(result.error ?? 'Export failed')
@@ -232,7 +267,7 @@ function App() {
                 <button key={tab} className={sourceTab === tab ? 'source-tab active' : 'source-tab'} onClick={() => setSourceTab(tab)}><span>{icon}</span>{label}</button>
               ))}
             </div>
-            <div className="direction-field"><label htmlFor="direction">TELL CLIPFORGE WHAT TO FIND <span>OPTIONAL</span></label><div className="direction-input"><span>✦</span><input id="direction" value={direction} onChange={(event) => setDirection(event.target.value)} placeholder="e.g. Find the funniest reactions or best advice..." /></div><div className="prompt-chips"><button onClick={() => setDirection('funniest reactions')}>Funniest moments</button><button onClick={() => setDirection('best advice')}>Best advice</button><button onClick={() => setDirection('big reactions')}>Big reactions</button></div></div>
+            <div className="direction-field"><label htmlFor="direction">TELL CLIPFORGE WHAT TO FIND <span>OPTIONAL</span></label><div className="direction-input"><span>✦</span><input id="direction" value={direction} onChange={(event) => setDirection(event.target.value)} placeholder="e.g. Find the funniest reactions or best advice..." /></div><div className="prompt-chips"><button onClick={() => setDirection('funniest reactions')}>Funniest moments</button><button onClick={() => setDirection('best advice')}>Best advice</button><button onClick={() => setDirection('big reactions')}>Big reactions</button><button className={analysisMode === 'montage' ? 'active' : ''} onClick={() => setAnalysisMode((current) => current === 'montage' ? 'highlights' : 'montage')}>{analysisMode === 'montage' ? '✓ Montage mode' : 'Create montage'}</button></div></div>
             {sourceTab === 'url' && (
               <div className="input-row">
                 <input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="Paste a YouTube URL..." />
@@ -272,11 +307,11 @@ function App() {
           <div className="panel highlights-panel">
             <div className="panel-heading">
               <div><p className="section-kicker">02 / HIGHLIGHTS</p><h2>Review suggestions</h2><p className="panel-help">Select a moment to preview and style it.</p></div>
-              <span className="result-count">3 moments</span>
+              <span className="result-count">{candidates.length} {analysisMode === 'montage' ? 'montage' : 'moments'}</span>
             </div>
             <div className="candidate-list">
               {candidates.map((candidate) => (
-                <button className={candidate.id === selectedId ? 'candidate selected' : 'candidate'} key={candidate.id} onClick={() => { setSelectedId(candidate.id); setTrimOffset(0); setTrimDuration(candidate.duration ?? 30) }}>
+                <button className={candidate.id === selectedId ? 'candidate selected' : 'candidate'} key={candidate.id} onClick={() => { setSelectedId(candidate.id); setTrimOffset(0); setTrimDuration(candidate.duration ?? 30); setStatus(`Preparing preview: ${candidate.title}`) }}>
                   <span className="candidate-thumb" style={{ background: candidate.color }}><span>▶</span></span>
                   <span className="candidate-info"><strong>{candidate.title}</strong><small>{candidate.time} · {candidate.reason}</small></span>
                   <span className="score"><small>match</small>{candidate.score}%</span>
@@ -293,14 +328,17 @@ function App() {
             <button className="export-button" onClick={exportClip} disabled={isExporting}>{isExporting ? 'Rendering...' : 'Export clip'} <span>↗</span></button>
           </div>
           <div className="editor-grid">
-            <div className="preview-wrap"><div className={`phone-preview ${activeTemplate === 'Custom split' ? 'phone-preview-split' : ''}`}>{activeTemplate === 'Custom split' && <><div className="split-game" style={{ width: `${splitRatio}%` }}><span>GAMEPLAY</span></div><div className="split-face" style={{ width: `${100 - splitRatio}%` }}><span>STREAMER CAM</span></div><div className="split-divider" style={{ left: `${splitRatio}%` }} /></>}{previewUrl && activeTemplate !== 'Custom split' && <video className="source-video" src={previewUrl} muted controls preload="metadata" />}<div className="preview-overlay"><div className="preview-top"><span>LIVE</span><small>clipforge</small></div><div className="preview-content"><span className="preview-tag">HIGHLIGHT</span><strong>{selectedClip.title}</strong>{captionsEnabled && <div className={`preview-caption preview-caption-${captionPosition}`}>THIS IS<br /><b>THE MOMENT</b></div>}</div><div className="preview-controls"><span>↶</span><div><i /><i /><i /><i /><i /></div><span>↷</span></div></div></div></div>
+            <div className="preview-wrap"><div className={`phone-preview frame-${activeFrame.toLowerCase().replaceAll(' ', '-')} ${activeTemplate === 'Custom split' ? 'phone-preview-split' : ''} ${activeTemplate === 'Top & Bottom split' ? 'phone-preview-stack' : ''}`}>{activeTemplate === 'Custom split' && <><div className="split-game" style={{ width: `${splitRatio}%` }}><span>GAMEPLAY</span></div><div className="split-face" style={{ width: `${100 - splitRatio}%` }}><span>STREAMER CAM</span></div><div className="split-divider" style={{ left: `${splitRatio}%` }} /></>}{activeTemplate === 'Top & Bottom split' && <><div className="stack-game" style={{ height: `${splitRatio}%`, top: stackTop === 'game' ? 0 : 'auto', bottom: stackTop === 'face' ? 0 : 'auto' }}><span>{stackTop === 'game' ? 'GAMEPLAY' : 'STREAMER CAM'}</span></div><div className="stack-face" style={{ height: `${100 - splitRatio}%`, top: stackTop === 'face' ? 0 : 'auto', bottom: stackTop === 'game' ? 0 : 'auto' }}><span>{stackTop === 'face' ? 'STREAMER CAM' : 'GAMEPLAY'}</span></div></>}{previewUrl && activeTemplate !== 'Custom split' && activeTemplate !== 'Top & Bottom split' && <video ref={previewVideoRef} className="source-video" src={previewUrl} muted preload="metadata" />}<div className="preview-overlay"><div className="preview-top"><span>LIVE</span><small>clipforge</small></div><div className="preview-content"><span className="preview-tag">HIGHLIGHT</span><strong>{selectedClip.title}</strong>{captionsEnabled && <div className={`preview-caption ${captionFontSize === 'Custom' ? 'caption-font-custom' : `caption-font-${captionFontSize.toLowerCase().replaceAll(' ', '-')}`} preview-caption-${captionPosition} caption-style-${captionStyle.toLowerCase()}`} style={captionFontSize === 'Custom' ? { fontSize: `${Math.min(24, Math.max(8, customCaptionFontSize / 4))}px` } : undefined}>THIS IS<br /><b>THE MOMENT</b></div>}</div><div className="preview-controls"><button className="preview-play" type="button" onClick={() => { const video = previewVideoRef.current; if (!video) return; if (video.paused) void video.play(); else video.pause() }} aria-label="Play preview">▶</button><div><i /><i /><i /><i /><i /></div><span>↷</span></div></div></div></div>
             <div className="editor-controls">
               <div className="control-group"><label>TIMELINE <span className="control-note">ADJUST THIS CLIP</span></label><div className="timeline-track"><i style={{ left: `${Math.min(86, trimOffset * 2)}%`, width: `${Math.min(88, trimDuration * 2)}%` }} /></div><div className="timeline-values"><label>Start offset <input type="range" min="0" max="15" value={trimOffset} onChange={(event) => setTrimOffset(Number(event.target.value))} /><b>+{trimOffset}s</b></label><label>Duration <input type="range" min="5" max="60" value={trimDuration} onChange={(event) => setTrimDuration(Number(event.target.value))} /><b>{trimDuration}s</b></label></div></div>
               <div className="control-group"><label>CAPTIONS <span className="control-note">BURNED INTO VIDEO</span></label><div className="choice-row"><button className={captionsEnabled ? 'choice active' : 'choice'} onClick={() => setCaptionsEnabled(true)}>On</button><button className={!captionsEnabled ? 'choice active' : 'choice'} onClick={() => setCaptionsEnabled(false)}>Off</button></div></div>
               {captionsEnabled && <><div className="control-group"><label>CAPTION LANGUAGE</label><div className="choice-row"><button className={captionLanguage === 'english' ? 'choice active' : 'choice'} onClick={() => setCaptionLanguage('english')}>English</button><button className={captionLanguage === 'hinglish' ? 'choice active' : 'choice'} onClick={() => setCaptionLanguage('hinglish')}>Hinglish (Roman)</button></div></div><div className="control-group"><label>CAPTION POSITION</label><div className="choice-row">{(['top', 'middle', 'bottom'] as const).map((position) => <button key={position} className={captionPosition === position ? 'choice active' : 'choice'} onClick={() => setCaptionPosition(position)}>{position[0].toUpperCase() + position.slice(1)}</button>)}</div></div></>}
               <div className="control-group"><label>CAPTION STYLE</label><div className="choice-row">{['Karaoke', 'Clean', 'Bold'].map((style) => <button key={style} className={captionStyle === style ? 'choice active' : 'choice'} onClick={() => setCaptionStyle(style)}>{style}</button>)}</div></div>
-              <div className="control-group"><label>TEMPLATE <span className="control-note">READY-TO-POST STYLES</span></label><div className="template-row">{['Punchy', 'Reaction', 'Neon', 'Chat pop', 'Custom split'].map((template, index) => <button key={template} className={activeTemplate === template ? 'template active' : 'template'} onClick={() => setActiveTemplate(template)}><span className={`template-art art-${index}`} />{template}</button>)}</div></div>
+              <div className="control-group"><label>CAPTION FONT SIZE</label><div className="choice-row">{(['Small', 'Medium', 'Large', 'Extra Large', 'Custom'] as const).map((size) => <button key={size} className={captionFontSize === size ? 'choice active' : 'choice'} onClick={() => setCaptionFontSize(size)}>{size}</button>)}</div>{captionFontSize === 'Custom' && <div className="custom-font-size"><input aria-label="Custom caption font size" type="number" min="20" max="96" step="1" value={customCaptionFontSize} onChange={(event) => setCustomCaptionFontSize(Math.min(96, Math.max(20, Number(event.target.value) || 20)))} /><span>px</span></div>}</div>
+              <div className="control-group"><label>TEMPLATE <span className="control-note">READY-TO-POST STYLES</span></label><div className="template-row">{['Punchy', 'Reaction', 'Neon', 'Chat pop', 'Custom split', 'Top & Bottom split'].map((template, index) => <button key={template} className={activeTemplate === template ? 'template active' : 'template'} onClick={() => setActiveTemplate(template)}><span className={`template-art art-${index}`} />{template}</button>)}</div></div>
+              <div className="control-group"><label>SHORTS FRAME <span className="control-note">TRENDING OVERLAY</span></label><div className="frame-row">{['None', 'Clean white', 'Neon pink', 'Neon cyan', 'Gold glow', 'Dark edge'].map((frame) => <button key={frame} className={activeFrame === frame ? 'choice active' : 'choice'} onClick={() => setActiveFrame(frame)}>{frame}</button>)}</div></div>
               {activeTemplate === 'Custom split' && <div className="custom-layout"><div className="custom-layout-heading"><div><strong>Custom split layout</strong><small>Drag each box over the part of the full video you want to keep.</small></div><span>LIVE EDIT</span></div><div className="crop-canvas">{previewUrl ? <video src={previewUrl} muted controls preload="metadata" /> : <div className="crop-placeholder"><span>FULL VIDEO PREVIEW</span><i /><i /><i /></div>}<div className="crop-box crop-box-game" style={{ left: `${gameFocus}%` }} onPointerDown={(event) => startCropDrag('game', event)}><b>GAMEPLAY</b><small>drag me</small></div><div className="crop-box crop-box-face" style={{ left: `${faceFocus}%` }} onPointerDown={(event) => startCropDrag('face', event)}><b>CAMERA</b><small>drag me</small></div></div><label className="split-control">Game width <input type="range" min="25" max="75" value={splitRatio} onChange={(event) => setSplitRatio(Number(event.target.value))} /><b>{splitRatio}%</b></label><div className="layout-hint">The boxes control the source crop. The width slider controls the final vertical split.</div></div>}
+              {activeTemplate === 'Top & Bottom split' && <div className="custom-layout"><div className="custom-layout-heading"><div><strong>Top &amp; Bottom split</strong><small>Choose what appears at the top and resize the two sections.</small></div><span>LIVE EDIT</span></div><div className="choice-row"><button className={stackTop === 'game' ? 'choice active' : 'choice'} onClick={() => setStackTop('game')}>Gameplay top</button><button className={stackTop === 'face' ? 'choice active' : 'choice'} onClick={() => setStackTop('face')}>Streamer top</button></div><label className="split-control"><span>{stackTop === 'game' ? 'Top gameplay height' : 'Top streamer height'}</span><input type="range" min="25" max="75" value={splitRatio} onChange={(event) => setSplitRatio(Number(event.target.value))} /><b>{splitRatio}%</b></label></div>}
               <div className="control-group"><label>FORMAT</label><div className="format-row"><span className="format-icon">▯</span><div><strong>Vertical 9:16</strong><small>1080 × 1920 · MP4</small></div><span className="check">✓</span></div></div>
             </div>
           </div>
